@@ -54,7 +54,6 @@ pub struct Persistent {
     /// Tracks if there are some unsaved changes due to the failure on save
     #[serde(skip)]
     pub dirty: AtomicBool,
-}
 
 impl Persistent {
     pub fn state(&self) -> &RaftState {
@@ -406,14 +405,12 @@ impl Persistent {
         }
         Ok(())
     }
-}
 
 #[derive(Serialize, Deserialize, Default, Debug)]
 pub struct SnapshotMetadataSer {
     pub term: u64,
     /// Aka: commit
     pub index: u64,
-}
 
 impl From<&SnapshotMetadata> for SnapshotMetadataSer {
     fn from(meta: &SnapshotMetadata) -> Self {
@@ -422,7 +419,6 @@ impl From<&SnapshotMetadata> for SnapshotMetadataSer {
             index: meta.index,
         }
     }
-}
 
 mod serialize_peer_addresses {
     use std::collections::HashMap;
@@ -452,7 +448,6 @@ mod serialize_peer_addresses {
         let addresses: HashMap<u64, Uri> = serialize_peer_addresses::deserialize(deserializer)?;
         Ok(Arc::new(RwLock::new(addresses)))
     }
-}
 
 /// Definition of struct to help with serde serialization.
 /// Should be used only in `[serde(with=...)]`
@@ -463,7 +458,6 @@ struct RaftStateDef {
     hard_state: HardState,
     #[serde(with = "ConfStateDef")]
     conf_state: ConfState,
-}
 
 /// Definition of struct to help with serde serialization.
 /// Should be used only in `[serde(with=...)]`
@@ -473,7 +467,6 @@ struct HardStateDef {
     term: u64,
     vote: u64,
     commit: u64,
-}
 
 /// Definition of struct to help with serde serialization.
 /// Should be used only in `[serde(with=...)]`
@@ -485,11 +478,12 @@ struct ConfStateDef {
     voters_outgoing: Vec<u64>,
     learners_next: Vec<u64>,
     auto_leave: bool,
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fs_err::File;
+    use tempfile::Builder;
 
     /// Reinitializing a removed peer as a first peer must drop every trace of the
     /// old cluster: `conf_state`, `first_voter` and the address book. Peers
@@ -536,6 +530,154 @@ mod tests {
                 .copied()
                 .collect::<Vec<_>>(),
             vec![this_peer_id],
+        );
+    }
+    fn test_legacy_cbor_to_json_migration() {
+        let temp_dir = Builder::new()
+            .prefix("test_raft_migration")
+            .tempdir()
+            .unwrap();
+        let path = temp_dir.path();
+
+        let cbor_path = path.join(STATE_FILE_NAME_CBOR);
+
+        let mut legacy_state = Persistent::default();
+        legacy_state.this_peer_id = 1337;
+        legacy_state.state.hard_state = HardState {
+            term: 5,
+            vote: 1337,
+            commit: 10,
+            ..Default::default()
+        };
+        legacy_state.state.conf_state = ConfState::from((vec![1337], vec![]));
+
+        let file = File::create(&cbor_path).unwrap();
+        serde_cbor::to_writer(file, &legacy_state).unwrap();
+
+        let json_path = path.join(STATE_FILE_NAME);
+        assert!(
+            !json_path.exists(),
+            "json file must not exist before migration"
+        );
+
+        // first load: triggers migration
+        let migrated = Persistent::load_or_init(path, false, false, None).unwrap();
+        assert_eq!(migrated.this_peer_id, 1337);
+        assert_eq!(migrated.state.hard_state.term, 5);
+        assert_eq!(migrated.state.hard_state.commit, 10);
+        assert!(
+            json_path.exists(),
+            "json file must be written after migration"
+        );
+
+        // second load: reads JSON directly, CBOR is no longer consulted
+        let reloaded = Persistent::load_or_init(path, false, false, None).unwrap();
+        assert_eq!(reloaded.this_peer_id, migrated.this_peer_id);
+        assert_eq!(
+            reloaded.state.hard_state.term,
+            migrated.state.hard_state.term
+        );
+        assert_eq!(
+            reloaded.state.hard_state.commit,
+            migrated.state.hard_state.commit
+        );
+    }
+
+    // new first peer node should boot as the only voter, set first_voter and write state to disk
+    #[test]
+    fn test_first_peer_bootstrap_initialises_sole_voter() {
+        let temp_dir = Builder::new()
+            .prefix("test_raft_bootstrap")
+            .tempdir()
+            .unwrap();
+        let path = temp_dir.path();
+
+        let state = Persistent::load_or_init(path, true, false, Some(42)).unwrap();
+
+        assert_eq!(state.this_peer_id, 42);
+        assert_eq!(
+            state.state.conf_state.voters,
+            vec![42],
+            "first peer must be the sole voter on bootstrap",
+        );
+        assert!(
+            state.state.conf_state.learners.is_empty(),
+            "no learners expected on a fresh bootstrap",
+        );
+        assert_eq!(
+            state.first_voter(),
+            Some(42),
+            "first_voter must be recorded for the bootstrapping peer",
+        );
+
+        // state must be on disk so a crash right after init doesn't lose it
+        assert!(
+            path.join(STATE_FILE_NAME).exists(),
+            "state file must exist after bootstrap",
+        );
+    }
+
+    // reinit on first peer should kick out everyone else and make it the sole voter again
+    #[test]
+    fn test_reinit_first_peer_evicts_others_and_reclaims_voter() {
+        let temp_dir = Builder::new()
+            .prefix("test_raft_reinit_first")
+            .tempdir()
+            .unwrap();
+        let path = temp_dir.path();
+
+        // set up a multi node cluster state
+        let mut state = Persistent::load_or_init(path, false, false, Some(100)).unwrap();
+        state.state.conf_state.voters = vec![100, 101, 102];
+        state.state.conf_state.learners = vec![200];
+        state.save().unwrap();
+
+        let reset = Persistent::load_or_init(path, true, true, None).unwrap();
+
+        assert_eq!(reset.this_peer_id, 100, "peer ID must be preserved");
+        assert_eq!(
+            reset.state.conf_state.voters,
+            vec![100],
+            "only self should remain as voter after first-peer reinit",
+        );
+        assert!(
+            reset.state.conf_state.learners.is_empty(),
+            "all learners must be evicted",
+        );
+        assert_eq!(
+            reset.state.hard_state.vote, 100,
+            "node must cast a vote for itself",
+        );
+    }
+
+    // reinit on a joining node should wipe the conf state but keep the peer ID
+    #[test]
+    fn test_reinit_non_first_peer_wipes_conf_state_preserves_peer_id() {
+        let temp_dir = Builder::new()
+            .prefix("test_raft_reinit_join")
+            .tempdir()
+            .unwrap();
+        let path = temp_dir.path();
+
+        // set up a multi node cluster state
+        let mut state = Persistent::load_or_init(path, false, false, Some(100)).unwrap();
+        state.state.conf_state.voters = vec![100, 101, 102];
+        state.state.conf_state.learners = vec![200];
+        state.save().unwrap();
+
+        let joining = Persistent::load_or_init(path, false, true, None).unwrap();
+
+        assert_eq!(
+            joining.this_peer_id, 100,
+            "peer ID must be preserved when re-joining a new cluster",
+        );
+        assert!(
+            joining.state.conf_state.voters.is_empty(),
+            "node must not be a voter until the new cluster admits it",
+        );
+        assert!(
+            joining.state.conf_state.learners.is_empty(),
+            "learners list must be cleared on non-first-peer reinit",
         );
     }
 }

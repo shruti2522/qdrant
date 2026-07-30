@@ -135,3 +135,93 @@ impl AliasPersistence {
         self.alias_mapping.0.contains_key(alias)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use tempfile::Builder;
+
+    use super::*;
+
+    #[test]
+    fn test_alias_mapping() {
+        let dir = Builder::new()
+            .prefix("alias_mapping_test")
+            .tempdir()
+            .unwrap();
+        let mut alias_persistence = AliasPersistence::open(dir.path()).unwrap();
+
+        alias_persistence
+            .insert("alias1".to_string(), "collection1".to_string())
+            .unwrap();
+        alias_persistence
+            .insert("alias2".to_string(), "collection1".to_string())
+            .unwrap();
+        alias_persistence
+            .insert("alias3".to_string(), "collection2".to_string())
+            .unwrap();
+
+        assert_eq!(
+            alias_persistence.get("alias1"),
+            Some("collection1".to_string())
+        );
+        assert_eq!(
+            alias_persistence.get("alias2"),
+            Some("collection1".to_string())
+        );
+        assert_eq!(
+            alias_persistence.get("alias3"),
+            Some("collection2".to_string())
+        );
+        assert_eq!(alias_persistence.get("alias4"), None);
+
+        assert!(alias_persistence.check_alias_exists("alias1"));
+        assert!(!alias_persistence.check_alias_exists("alias4"));
+
+        let mut coll1_aliases = alias_persistence.collection_aliases("collection1");
+        coll1_aliases.sort();
+        assert_eq!(
+            coll1_aliases,
+            vec!["alias1".to_string(), "alias2".to_string()]
+        );
+
+        let coll2_aliases = alias_persistence.collection_aliases("collection2");
+        assert_eq!(coll2_aliases, vec!["alias3".to_string()]);
+
+        alias_persistence
+            .rename_alias("alias1", "alias1_renamed".to_string())
+            .unwrap();
+        assert_eq!(alias_persistence.get("alias1"), None);
+        assert_eq!(
+            alias_persistence.get("alias1_renamed"),
+            Some("collection1".to_string())
+        );
+
+        let rename_err = alias_persistence.rename_alias("non_existent", "new_name".to_string());
+        assert!(rename_err.is_err());
+        assert!(matches!(
+            rename_err.unwrap_err(),
+            StorageError::NotFound { .. }
+        ));
+
+        let removed = alias_persistence.remove("alias1_renamed").unwrap();
+        assert_eq!(removed, Some("collection1".to_string()));
+        assert_eq!(alias_persistence.get("alias1_renamed"), None);
+
+        let removed_none = alias_persistence.remove("alias_not_found").unwrap();
+        assert_eq!(removed_none, None);
+
+        alias_persistence.remove_collection("collection1").unwrap();
+        assert_eq!(alias_persistence.get("alias2"), None);
+        assert_eq!(
+            alias_persistence.get("alias3"),
+            Some("collection2".to_string())
+        );
+
+        let alias_persistence_reopened = AliasPersistence::open(dir.path()).unwrap();
+        assert_eq!(
+            alias_persistence_reopened.get("alias3"),
+            Some("collection2".to_string())
+        );
+        assert_eq!(alias_persistence_reopened.get("alias2"), None);
+    }
+}
